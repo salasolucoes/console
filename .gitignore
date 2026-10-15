@@ -1,0 +1,17 @@
+/vendor
+/node_modules
+/storage
+/.php-cs-fixer.cache
+/.phpstan.cache
+/.pest-cache
+/.phpunit.cache
+/.phpunit.result.cache
+/coverage
+/AGENTS
+*.log
+.env
+.env.local
+*.swp
+*.swo
+*~
+.DS_Store

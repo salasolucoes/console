@@ -1,0 +1,148 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Sala\Console\Console\DatabaseManager;
+use Sala\Console\Console\PhinxRunner;
+use Sala\Console\Console\StubService;
+use Sala\Console\ConsoleApplication;
+
+/*
+|--------------------------------------------------------------------------
+| sala/console — entrypoint universal
+|--------------------------------------------------------------------------
+|
+| Este ficheiro funciona em três cenários sem alterações:
+|
+|   1. Pacote standalone:   php bin/console            (cwd = pacote)
+|   2. Projeto consumidor:  php console               (copiado para a raiz)
+|   3. Via Composer:        php vendor/bin/console    (proxy do vendor/bin)
+|
+| Deteta automaticamente a raiz do projeto a partir do autoloader,
+| carrega o .env e config/*.php, e inicializa o Eloquent se existir
+| configuração de base de dados.
+|
+*/
+
+// --- 1. Localiza o autoloader do Composer -------------------------------
+$autoload = null;
+
+// Prioridade 1: proxy do Composer (`vendor/bin/console`) — autoritativo,
+// mesmo quando o pacote está instalado por path/symlink e tem vendor próprio.
+if (! empty($GLOBALS['_composer_autoload_path']) && is_file($GLOBALS['_composer_autoload_path'])) {
+    $autoload = $GLOBALS['_composer_autoload_path'];
+} elseif (! empty($GLOBALS['_composer_bin_dir'])) {
+    $candidate = dirname(dirname($GLOBALS['_composer_bin_dir'])).'/autoload.php';
+
+    if (is_file($candidate)) {
+        $autoload = $candidate;
+    }
+}
+
+// Prioridade 2: localização do próprio ficheiro.
+if ($autoload === null) {
+    $candidates = [
+        __DIR__.'/vendor/autoload.php',     // console copiado para a raiz do projeto
+        __DIR__.'/../vendor/autoload.php',  // pacote standalone (bin/../vendor)
+        __DIR__.'/../../../autoload.php',   // vendor/sala/console/bin/console
+        getcwd().'/vendor/autoload.php',    // executado a partir da raiz do projeto
+    ];
+
+    foreach ($candidates as $candidate) {
+        if (is_file($candidate)) {
+            $autoload = $candidate;
+            break;
+        }
+    }
+}
+
+if ($autoload === null) {
+    fwrite(STDERR, "sala/console: não foi possível localizar vendor/autoload.php.\n");
+    exit(1);
+}
+
+$autoload = realpath($autoload) ?: $autoload;
+
+require $autoload;
+
+// Raiz do projeto = pasta que contém o vendor/
+$projectRoot = dirname(dirname($autoload));
+
+// Garante que todos os caminhos relativos (stubs, views, phinx) apontam para a raiz
+chdir($projectRoot);
+
+// --- 2. .env ------------------------------------------------------------
+if (class_exists(\Dotenv\Dotenv::class) && is_file($projectRoot.'/.env')) {
+    \Dotenv\Dotenv::createImmutable($projectRoot)->load();
+}
+
+if (! function_exists('env')) {
+    function env(string $key, mixed $default = null): mixed
+    {
+        return $_ENV[$key] ?? $_SERVER[$key] ?? $default;
+    }
+}
+
+// --- 3. config/*.php ----------------------------------------------------
+$configData = [];
+$configDir = $projectRoot.'/config';
+
+if (is_dir($configDir)) {
+    foreach (glob($configDir.'/*.php') ?: [] as $file) {
+        $name = basename($file, '.php');
+        $configData[$name] = require $file;
+    }
+}
+
+// --- 4. Container + Eloquent -------------------------------------------
+$config = null;
+$defaultConnection = 'mysql';
+$dbConfig = [];
+
+if (class_exists(\Illuminate\Container\Container::class)) {
+    $container = \Illuminate\Container\Container::getInstance();
+
+    if (class_exists(\Illuminate\Config\Repository::class) && ! empty($configData)) {
+        $config = new \Illuminate\Config\Repository($configData);
+        $container->instance('config', $config);
+    }
+
+    if (class_exists(\Illuminate\Database\Capsule\Manager::class)) {
+        $capsule = new \Illuminate\Database\Capsule\Manager($container);
+
+        $defaultConnection = $config?->get('database.default')
+            ?: (string) env('DB_CONNECTION', 'mysql');
+
+        $dbConfig = $config?->get("database.connections.{$defaultConnection}") ?? [];
+
+        if (empty($dbConfig) && $defaultConnection !== 'mysql') {
+            $defaultConnection = 'mysql';
+            $dbConfig = $config?->get('database.connections.mysql') ?? [];
+        }
+
+        if (! empty($dbConfig)) {
+            $capsule->addConnection($dbConfig);
+            $capsule->setAsGlobal();
+            $capsule->bootEloquent();
+        }
+    }
+}
+
+// --- 5. Aplicação + serviços partilhados --------------------------------
+$app = new ConsoleApplication('Sala Console', '1.0.0');
+
+$dbManager = new DatabaseManager(is_array($dbConfig) ? $dbConfig : []);
+
+$phinxConfig = [];
+if (is_file($projectRoot.'/phinx.php')) {
+    $phinxConfig['configuration'] = $projectRoot.'/phinx.php';
+}
+
+$phinxRunner = new PhinxRunner(null, $phinxConfig);
+$stubService = new StubService;
+
+$app->setSharedServices($dbManager, $phinxRunner, $stubService);
+$app->setConfig($configData['console'] ?? []);
+
+$app->run();
